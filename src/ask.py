@@ -1,9 +1,9 @@
-"""Hybrid RAG QA script combining PostgreSQL financials, ChromaDB 10-K chunks, and Ollama."""
+"""Hybrid RAG QA module combining PostgreSQL financials, ChromaDB 10-K chunks, and Ollama."""
 import argparse
 import os
 import re
 from pathlib import Path
-from typing import Optional
+from typing import Any, Dict, List, Optional
 
 import ollama
 import psycopg2
@@ -32,10 +32,10 @@ def get_db_connection():
     )
 
 
-def fetch_sql_context(ticker: Optional[str], year: Optional[int]) -> str:
+def fetch_sql_context(ticker: Optional[str], year: Optional[int]) -> Dict[str, Any]:
     """Fetch structured financial metrics from PostgreSQL if ticker is provided."""
     if not ticker:
-        return "No specific ticker provided for SQL financial metrics."
+        return {"text": "No specific ticker provided for SQL financial metrics.", "rows": []}
 
     try:
         conn = get_db_connection()
@@ -49,31 +49,39 @@ def fetch_sql_context(ticker: Optional[str], year: Optional[int]) -> str:
         )
         tables = {row[0] for row in cur.fetchall()}
 
-        rows_text = []
-        if "financial_metrics" in tables or "financials" in tables:
-            tbl = "financial_metrics" if "financial_metrics" in tables else "financials"
+        rows_out: List[Dict[str, Any]] = []
+        rows_text: List[str] = []
+
+        candidate_tables = [t for t in ["financial_metrics", "financials", "filings"] if t in tables]
+        for tbl in candidate_tables:
             cur.execute(
-                f"SELECT * FROM {tbl} WHERE UPPER(ticker) = %s ORDER BY fiscal_year DESC LIMIT 10",
+                f"SELECT * FROM {tbl} WHERE UPPER(ticker) = %s LIMIT 10",
                 (ticker.upper(),),
             )
             cols = [desc[0] for desc in cur.description]
             for r in cur.fetchall():
                 row_dict = dict(zip(cols, r))
-                if year is None or row_dict.get("fiscal_year") == year:
-                    rows_text.append(", ".join(f"{k}: {v}" for k, v in row_dict.items() if v is not None))
+                if year is not None and "fiscal_year" in row_dict and row_dict["fiscal_year"] != year:
+                    continue
+                cleaned = {k: (str(v) if v is not None else None) for k, v in row_dict.items() if v is not None}
+                rows_out.append({"table": tbl, "data": cleaned})
+                rows_text.append(f"[{tbl}] " + ", ".join(f"{k}: {v}" for k, v in cleaned.items()))
 
         cur.close()
         conn.close()
 
         if rows_text:
-            return "\n".join(rows_text)
-        return f"No structured SQL financial rows matched ticker={ticker.upper()} year={year}."
+            return {"text": "\n".join(rows_text), "rows": rows_out}
+        return {
+            "text": f"No structured SQL rows matched ticker={ticker.upper()} year={year}.",
+            "rows": [],
+        }
     except Exception as exc:
-        return f"[SQL lookup skipped/unavailable: {exc}]"
+        return {"text": f"[SQL lookup skipped/unavailable: {exc}]", "rows": []}
 
 
 def detect_filters(question: str, ticker: Optional[str], year: Optional[int]):
-    """Infer ticker or 4-digit year from the question if not explicitly passed via CLI flags."""
+    """Infer ticker or 4-digit year from the question if not explicitly passed."""
     inferred_ticker = ticker.upper() if ticker else None
     inferred_year = year
 
@@ -90,33 +98,47 @@ def detect_filters(question: str, ticker: Optional[str], year: Optional[int]):
     return inferred_ticker, inferred_year
 
 
-def answer_question(
+def ask_structured(
     question: str,
     ticker: Optional[str] = None,
     year: Optional[int] = None,
     section: Optional[str] = None,
     top_k: int = 5,
     model: str = LLM_MODEL,
-):
+) -> Dict[str, Any]:
+    """Run hybrid RAG and return answer, sources, and SQL context."""
     ticker, year = detect_filters(question, ticker, year)
-    print(f"Filters -> ticker={ticker or 'ALL'}, year={year or 'ALL'}, section={section or 'ALL'}")
 
-    sql_context = fetch_sql_context(ticker, year)
+    sql_info = fetch_sql_context(ticker, year)
+    sql_context = sql_info["text"]
 
     embedder = SentenceTransformer(MODEL_NAME)
     q_vec = embedder.encode([question], normalize_embeddings=True).tolist()[0]
     res = query_chroma(q_vec, top_k, ticker, year, section)
 
-    docs = res["documents"][0]
-    metas = res["metadatas"][0]
-    dists = res["distances"][0]
+    docs = res["documents"][0] if res.get("documents") else []
+    metas = res["metadatas"][0] if res.get("metadatas") else []
+    dists = res["distances"][0] if res.get("distances") else []
 
-    excerpts = []
-    sources = []
+    excerpts: List[str] = []
+    sources: List[Dict[str, Any]] = []
+
     for idx, (doc, meta, dist) in enumerate(zip(docs, metas, dists), 1):
+        meta = meta or {}
         tag = f"[{meta.get('ticker')} FY{meta.get('fiscal_year')} Item {meta.get('section')} | chunk {meta.get('chunk_index')}]"
-        sim = round(1 - dist, 3)
-        sources.append(f"{idx}. {tag} (similarity={sim})")
+        sim = round(1 - float(dist), 3)
+        sources.append(
+            {
+                "rank": idx,
+                "tag": tag,
+                "ticker": meta.get("ticker"),
+                "fiscal_year": meta.get("fiscal_year"),
+                "section": meta.get("section"),
+                "chunk_index": meta.get("chunk_index"),
+                "similarity": sim,
+                "preview": doc[:280].replace("\n", " "),
+            }
+        )
         excerpts.append(f"Source {idx} {tag}:\n{doc}")
 
     excerpts_block = "\n\n---\n\n".join(excerpts) if excerpts else "No matching 10-K text chunks found."
@@ -135,7 +157,6 @@ def answer_question(
         "Provide a clear, well-structured answer with inline citations."
     )
 
-    print(f"Generating answer with Ollama ({model})...\n")
     response = ollama.chat(
         model=model,
         messages=[
@@ -144,12 +165,40 @@ def answer_question(
         ],
     )
 
+    return {
+        "answer": response["message"]["content"],
+        "filters": {"ticker": ticker, "year": year, "section": section, "top_k": top_k},
+        "model": model,
+        "sources": sources,
+        "sql_rows": sql_info["rows"],
+    }
+
+
+def answer_question(
+    question: str,
+    ticker: Optional[str] = None,
+    year: Optional[int] = None,
+    section: Optional[str] = None,
+    top_k: int = 5,
+    model: str = LLM_MODEL,
+):
+    result = ask_structured(
+        question=question,
+        ticker=ticker,
+        year=year,
+        section=section,
+        top_k=top_k,
+        model=model,
+    )
+    f = result["filters"]
+    print(f"Filters -> ticker={f['ticker'] or 'ALL'}, year={f['year'] or 'ALL'}, section={f['section'] or 'ALL'}")
+    print(f"Generating answer with Ollama ({result['model']})...\n")
     print("=" * 60)
-    print(response["message"]["content"])
+    print(result["answer"])
     print("=" * 60)
     print("\nSources used:")
-    for s in sources:
-        print(" ", s)
+    for s in result["sources"]:
+        print(f"  {s['rank']}. {s['tag']} (similarity={s['similarity']})")
 
 
 def main():

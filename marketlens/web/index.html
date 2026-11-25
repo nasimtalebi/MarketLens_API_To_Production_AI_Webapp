@@ -1,0 +1,140 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>MarketLens — 10-K Financial RAG Assistant</title>
+  <style>
+    * { box-sizing: border-box; font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; }
+    body { margin: 0; background: #0f172a; color: #e2e8f0; }
+    .container { max-width: 960px; margin: 32px auto; padding: 0 20px; }
+    .header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 24px; }
+    .header h1 { margin: 0; font-size: 1.6rem; color: #38bdf8; }
+    .badge { background: #1e293b; border: 1px solid #334155; padding: 6px 12px; border-radius: 999px; font-size: 0.85rem; color: #94a3b8; }
+    .card { background: #1e293b; border: 1px solid #334155; border-radius: 12px; padding: 20px; margin-bottom: 20px; }
+    .filters { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin-bottom: 14px; }
+    label { display: block; font-size: 0.8rem; color: #94a3b8; margin-bottom: 6px; }
+    input, select, textarea {
+      width: 100%; background: #0f172a; border: 1px solid #475569; color: #f8fafc;
+      border-radius: 8px; padding: 10px; font-size: 0.95rem;
+    }
+    textarea { min-height: 84px; resize: vertical; }
+    button {
+      margin-top: 14px; background: #0284c7; color: white; border: none;
+      padding: 11px 22px; border-radius: 8px; font-size: 0.95rem; font-weight: 600; cursor: pointer;
+    }
+    button:hover { background: #0369a1; }
+    button:disabled { opacity: 0.5; cursor: not-allowed; }
+    .answer-box { white-space: pre-wrap; line-height: 1.6; color: #f1f5f9; }
+    .source-item { background: #0f172a; border: 1px solid #334155; border-radius: 8px; padding: 12px; margin-top: 10px; }
+    .source-meta { font-size: 0.85rem; color: #38bdf8; font-weight: 600; margin-bottom: 6px; }
+    .source-preview { font-size: 0.88rem; color: #cbd5e1; }
+    .status { margin-top: 10px; font-size: 0.9rem; color: #fbbf24; }
+    @media (max-width: 700px) { .filters { grid-template-columns: 1fr 1fr; } }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="header">
+      <h1>MarketLens</h1>
+      <span class="badge">PostgreSQL + ChromaDB + Ollama (llama3.2)</span>
+    </div>
+
+    <div class="card">
+      <div class="filters">
+        <div>
+          <label for="ticker">Ticker (optional)</label>
+          <input id="ticker" placeholder="e.g. NVDA, AAPL" />
+        </div>
+        <div>
+          <label for="year">Fiscal Year (optional)</label>
+          <input id="year" type="number" placeholder="e.g. 2024" />
+        </div>
+        <div>
+          <label for="section">10-K Item (optional)</label>
+          <select id="section">
+            <option value="">All Items</option>
+            <option value="1">Item 1 (Business)</option>
+            <option value="1A">Item 1A (Risk Factors)</option>
+            <option value="7">Item 7 (MD&A)</option>
+          </select>
+        </div>
+        <div>
+          <label for="top_k">Top Chunks (k)</label>
+          <input id="top_k" type="number" value="5" min="1" max="15" />
+        </div>
+      </div>
+
+      <label for="question">Ask a financial question about 10-K filings</label>
+      <textarea id="question" placeholder="e.g. What are NVIDIA's main supply chain and manufacturing risks in 2024?"></textarea>
+
+      <button id="askBtn" onclick="sendQuestion()">Ask MarketLens</button>
+      <div id="status" class="status"></div>
+    </div>
+
+    <div id="resultCard" class="card" style="display:none;">
+      <h2 style="margin-top:0; font-size:1.15rem; color:#38bdf8;">Answer</h2>
+      <div id="answerBox" class="answer-box"></div>
+      <h3 style="margin-top:20px; font-size:1rem; color:#94a3b8;">Retrieved Sources</h3>
+      <div id="sourcesBox"></div>
+    </div>
+  </div>
+
+  <script>
+    async function sendQuestion() {
+      const btn = document.getElementById("askBtn");
+      const status = document.getElementById("status");
+      const resultCard = document.getElementById("resultCard");
+      const answerBox = document.getElementById("answerBox");
+      const sourcesBox = document.getElementById("sourcesBox");
+
+      const question = document.getElementById("question").value.trim();
+      if (!question) {
+        status.textContent = "Please enter a question first.";
+        return;
+      }
+
+      const ticker = document.getElementById("ticker").value.trim() || null;
+      const yearRaw = document.getElementById("year").value.trim();
+      const year = yearRaw ? parseInt(yearRaw, 10) : null;
+      const section = document.getElementById("section").value || null;
+      const top_k = parseInt(document.getElementById("top_k").value, 10) || 5;
+
+      btn.disabled = true;
+      status.textContent = "Searching ChromaDB & PostgreSQL and generating response with Ollama...";
+      resultCard.style.display = "none";
+
+      try {
+        const res = await fetch("/api/ask", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ question, ticker, year, section, top_k })
+        });
+        const data = await res.json();
+        if (!res.ok) {
+          throw new Error(data.detail || "Request failed");
+        }
+
+        answerBox.textContent = data.answer || "No answer returned.";
+        sourcesBox.innerHTML = "";
+        (data.sources || []).forEach(s => {
+          const div = document.createElement("div");
+          div.className = "source-item";
+          div.innerHTML = `
+            <div class="source-meta">${s.rank}. ${s.tag} — similarity: ${s.similarity}</div>
+            <div class="source-preview">${s.preview}</div>
+          `;
+          sourcesBox.appendChild(div);
+        });
+
+        resultCard.style.display = "block";
+        status.textContent = "";
+      } catch (err) {
+        status.textContent = "Error: " + err.message;
+      } finally {
+        btn.disabled = false;
+      }
+    }
+  </script>
+</body>
+</html>
