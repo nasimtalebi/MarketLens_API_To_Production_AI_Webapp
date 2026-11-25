@@ -7,3 +7,7 @@ __pycache__/
 
 # Raw SEC downloads: re-create with python src/ingest_edgar.py
 data/
+
+chroma_db/
+chroma_test/
+run_log.txt
